@@ -90,27 +90,42 @@ export function groupPhotosBySimilarity(
   return rawClusters.map((cluster, idx) => buildPhotoGroup(cluster, idx, closeCallThreshold));
 }
 
+/**
+ * ユーザーが手動でグループのシーン（人物/料理・モノ/風景/資料）を切り替えた際、
+ * そのシーンの評価基準でグループ内写真を再採点・再ソートする
+ */
+export function recalculateGroupWithScene(
+  group: PhotoGroup,
+  forcedScene: SceneType,
+  closeCallThreshold = 5.0
+): PhotoGroup {
+  return buildPhotoGroup(group.photos, 0, closeCallThreshold, forcedScene, group.id);
+}
+
 function buildPhotoGroup(
   cluster: PhotoItem[],
   groupIndex: number,
-  closeCallThreshold: number
+  closeCallThreshold: number,
+  forcedScene?: SceneType,
+  existingGroupId?: string
 ): PhotoGroup {
-  // グループ内で1枚でもMediaPipeが人物の顔を検出していれば、連写グループ全体を「人物(portrait)」として扱う
   const hasAnyFaceInCluster = cluster.some((p) => p.metrics.faceCount > 0);
 
-  let groupScene: SceneType = cluster[0].scene;
-  if (hasAnyFaceInCluster) {
-    groupScene = 'portrait';
-  } else {
-    const sceneCounts = new Map<SceneType, number>();
-    for (const p of cluster) {
-      sceneCounts.set(p.scene, (sceneCounts.get(p.scene) || 0) + 1);
-    }
-    let maxCount = -1;
-    for (const [sc, cnt] of sceneCounts.entries()) {
-      if (cnt > maxCount) {
-        maxCount = cnt;
-        groupScene = sc;
+  let groupScene: SceneType = forcedScene || cluster[0].scene;
+  if (!forcedScene) {
+    if (hasAnyFaceInCluster) {
+      groupScene = 'portrait';
+    } else {
+      const sceneCounts = new Map<SceneType, number>();
+      for (const p of cluster) {
+        sceneCounts.set(p.scene, (sceneCounts.get(p.scene) || 0) + 1);
+      }
+      let maxCount = -1;
+      for (const [sc, cnt] of sceneCounts.entries()) {
+        if (cnt > maxCount) {
+          maxCount = cnt;
+          groupScene = sc;
+        }
       }
     }
   }
@@ -198,7 +213,7 @@ function buildPhotoGroup(
   const isCloseCall = refinedPhotos.length >= 2 && scoreDiff < closeCallThreshold;
 
   return {
-    id: `group_${groupIndex}_${refinedPhotos[0].id}`,
+    id: existingGroupId || `group_${groupIndex}_${refinedPhotos[0].id}`,
     photos: refinedPhotos,
     selectedIds: [refinedPhotos[0].id],
     excluded: false,

@@ -1,11 +1,12 @@
 import React from 'react';
-import { X, Sun, Moon } from 'lucide-react';
+import { X, Sun, Moon, Trash2 } from 'lucide-react';
 import { AppSettings } from '../types';
 
 interface SettingsModalProps {
   isOpen: boolean;
   settings: AppSettings;
   onUpdateSettings: (partial: Partial<AppSettings>) => void;
+  onClearCredentials: () => void;
   onClose: () => void;
 }
 
@@ -13,9 +14,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   settings,
   onUpdateSettings,
+  onClearCredentials,
   onClose
 }) => {
   if (!isOpen) return null;
+
+  const hasSavedKeys = Boolean(
+    settings.geminiApiKey.trim() ||
+      settings.googleClientId.trim() ||
+      settings.googleDriveParentFolderId.trim()
+  );
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 overflow-y-auto">
@@ -89,6 +97,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <label className="block text-gray-400 mb-1">API キー</label>
               <input
                 type="password"
+                autoComplete="off"
                 value={settings.geminiApiKey}
                 onChange={(e) => onUpdateSettings({ geminiApiKey: e.target.value })}
                 placeholder="AIzaSy..."
@@ -116,6 +125,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <label className="block text-gray-400 mb-1">OAuth クライアント ID</label>
               <input
                 type="text"
+                autoComplete="off"
                 value={settings.googleClientId}
                 onChange={(e) => onUpdateSettings({ googleClientId: e.target.value })}
                 placeholder="xxxx.apps.googleusercontent.com"
@@ -123,9 +133,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               />
             </div>
             <div>
-              <label className="block text-gray-400 mb-1">保存先の親フォルダID（空欄でマイドライブ直下）</label>
+              <label className="block text-gray-400 mb-1">
+                保存先の親フォルダID（空欄でマイドライブ直下）
+              </label>
               <input
                 type="text"
+                autoComplete="off"
                 value={settings.googleDriveParentFolderId}
                 onChange={(e) => onUpdateSettings({ googleDriveParentFolderId: e.target.value })}
                 placeholder="フォルダID"
@@ -134,7 +147,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
-          <div className="flex justify-end pt-2">
+          <div className="flex items-center justify-between pt-2 border-t border-gray-800">
+            {hasSavedKeys ? (
+              <button
+                onClick={onClearCredentials}
+                className="px-3 py-1.5 rounded-lg bg-rose-950/60 hover:bg-rose-900/70 text-rose-300 border border-rose-800/50 flex items-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>保存済みキーを消去</span>
+              </button>
+            ) : (
+              <span />
+            )}
+
             <button
               onClick={onClose}
               className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium"

@@ -1,6 +1,11 @@
 import { PhotoItem, RawImageMetrics, SceneType, ScoreBreakdown } from '../types';
 import { extractExif } from './exifUtils';
 import { analyzeFacesOnCanvas, PortraitAnalysisResult } from './faceDetector';
+import {
+  sanitizeFileName,
+  validateFileSizeAndBasics,
+  validateImageMagicBytes
+} from './securityUtils';
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'avif']);
 const RAW_EXTENSIONS = new Set(['arw', 'cr2', 'cr3', 'nef', 'nrw', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw']);
@@ -17,24 +22,31 @@ export function pairImportedFiles(files: File[], enableRawPairing: boolean): Pai
   const standaloneImages: PairedFileEntry[] = [];
 
   for (const file of files) {
-    if (file.name.startsWith('.')) continue;
-    const dotIdx = file.name.lastIndexOf('.');
+    if (!file || !file.name || file.name.startsWith('.')) continue;
+    const safeName = sanitizeFileName(file.name, '');
+    if (!safeName) continue;
+    const dotIdx = safeName.lastIndexOf('.');
     if (dotIdx === -1) continue;
 
-    const baseName = file.name.slice(0, dotIdx);
-    const ext = file.name.slice(dotIdx + 1).toLowerCase();
+    const baseName = safeName.slice(0, dotIdx);
+    const ext = safeName.slice(dotIdx + 1).toLowerCase();
     const key = baseName.toLowerCase();
 
     if (IMAGE_EXTENSIONS.has(ext)) {
-      imageMap.set(key, file);
+      if (validateFileSizeAndBasics(file, false).valid) {
+        imageMap.set(key, file);
+      }
     } else if (RAW_EXTENSIONS.has(ext)) {
-      rawMap.set(key, file);
+      if (validateFileSizeAndBasics(file, true).valid) {
+        rawMap.set(key, file);
+      }
     }
   }
 
   for (const [key, imageFile] of imageMap.entries()) {
-    const dotIdx = imageFile.name.lastIndexOf('.');
-    const baseName = imageFile.name.slice(0, dotIdx);
+    const safeImgName = sanitizeFileName(imageFile.name);
+    const dotIdx = safeImgName.lastIndexOf('.');
+    const baseName = dotIdx > 0 ? safeImgName.slice(0, dotIdx) : safeImgName;
     const rawFile = enableRawPairing ? rawMap.get(key) : undefined;
     standaloneImages.push({
       baseName,
@@ -52,6 +64,12 @@ export async function analyzePhotoEntry(
 ): Promise<PhotoItem> {
   const { imageFile, rawFile, baseName } = entry;
 
+  // マジックバイト検証（拡張子偽装ファイルや破損ヘッダーを事前排除）
+  const isValidMagic = await validateImageMagicBytes(imageFile);
+  if (!isValidMagic) {
+    throw new Error(`非対応または破損した画像ファイルです: ${ sanitizeFileName(imageFile.name) }`);
+  }
+
   const [exifFromHeader, thumbResult] = await Promise.all([
     extractExif(imageFile),
     createThumbnailAndAnalysisData(imageFile, 1024)
@@ -65,14 +83,16 @@ export async function analyzePhotoEntry(
 
   const scene = classifyScene(thumbResult.metrics);
   const score = calculateSceneScore(scene, thumbResult.metrics);
+  const safeFileName = sanitizeFileName(imageFile.name);
+  const safeRawName = rawFile ? sanitizeFileName(rawFile.name, `${baseName}.ARW`) : undefined;
 
   return {
     id: `photo_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 7)}`,
     file: imageFile,
-    fileName: imageFile.name,
+    fileName: safeFileName,
     baseName,
     rawFile,
-    rawFileName: rawFile?.name,
+    rawFileName: safeRawName,
     thumbnailUrl: thumbResult.thumbnailUrl,
     thumbnailWidth: thumbResult.thumbWidth,
     thumbnailHeight: thumbResult.thumbHeight,

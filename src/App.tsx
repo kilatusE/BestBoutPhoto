@@ -13,12 +13,17 @@ import {
   Loader2,
   RotateCcw,
   Sun,
-  Moon
+  Moon,
+  XCircle
 } from 'lucide-react';
 import { AppSettings, PhotoGroup, PhotoItem, SceneType } from './types';
 import { analyzePhotoEntry, pairImportedFiles } from './utils/imageAnalyzer';
 import { getVisionEngines } from './utils/faceDetector';
-import { groupPhotosBySimilarity, SCENE_META } from './utils/groupingEngine';
+import {
+  groupPhotosBySimilarity,
+  recalculateGroupWithScene,
+  SCENE_META
+} from './utils/groupingEngine';
 import { judgeGroupWithGemini } from './utils/geminiClient';
 import { getSelectedPhotos } from './utils/exportEngine';
 import { generateDemoPhotoFiles } from './utils/demoGenerator';
@@ -64,6 +69,8 @@ export const App: React.FC = () => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analyzeProgress, setAnalyzeProgress] = useState({ current: 0, total: 0, fileName: '' });
   const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
+  const cancelImportRef = useRef(false);
 
   const [activeGroupId, setActiveGroupId] = useState<string | null>(null);
   const [isExportOpen, setIsExportOpen] = useState(false);
@@ -77,7 +84,6 @@ export const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
-  // MediaPipe 顔・瞳検出エンジンをバックグラウンドでウォームアップ
   useEffect(() => {
     getVisionEngines();
   }, []);
@@ -97,6 +103,15 @@ export const App: React.FC = () => {
 
   const updateSettings = (partial: Partial<AppSettings>) => {
     setSettings((prev) => ({ ...prev, ...partial }));
+  };
+
+  const handleClearCredentials = () => {
+    setSettings((prev) => ({
+      ...prev,
+      geminiApiKey: '',
+      googleClientId: '',
+      googleDriveParentFolderId: ''
+    }));
   };
 
   useEffect(() => {
@@ -132,34 +147,63 @@ export const App: React.FC = () => {
     });
   }, [photos, settings.groupingSensitivity, settings.closeCallThreshold]);
 
+  // 1枚ごとのエラー耐性（破損ファイルスキップ）および中断に対応したバッチインポート
   const handleImportFiles = async (rawFileList: File[]) => {
     if (rawFileList.length === 0) return;
     const pairedEntries = pairImportedFiles(rawFileList, settings.pairRaw);
-    if (pairedEntries.length === 0) return;
+    if (pairedEntries.length === 0) {
+      setImportNotice('対応する画像ファイルが見つかりませんでした。');
+      return;
+    }
 
+    cancelImportRef.current = false;
+    setImportNotice(null);
     setIsAnalyzing(true);
     setAnalyzeProgress({ current: 0, total: pairedEntries.length, fileName: '' });
 
     const newPhotoItems: PhotoItem[] = [];
+    let skippedCount = 0;
     const concurrency = 3;
+
     for (let i = 0; i < pairedEntries.length; i += concurrency) {
+      if (cancelImportRef.current) break;
+
       const batch = pairedEntries.slice(i, i + concurrency);
       const results = await Promise.all(
         batch.map(async (entry, idx) => {
-          const item = await analyzePhotoEntry(entry, photos.length + i + idx);
-          setAnalyzeProgress((prev) => ({
-            current: Math.min(pairedEntries.length, prev.current + 1),
-            total: pairedEntries.length,
-            fileName: entry.imageFile.name
-          }));
-          return item;
+          if (cancelImportRef.current) return null;
+          try {
+            const item = await analyzePhotoEntry(entry, photos.length + i + idx);
+            return item;
+          } catch {
+            skippedCount++;
+            return null;
+          } finally {
+            setAnalyzeProgress((prev) => ({
+              current: Math.min(pairedEntries.length, prev.current + 1),
+              total: pairedEntries.length,
+              fileName: entry.imageFile.name
+            }));
+          }
         })
       );
-      newPhotoItems.push(...results);
+
+      for (const r of results) {
+        if (r) newPhotoItems.push(r);
+      }
     }
 
-    setPhotos((prev) => [...prev, ...newPhotoItems]);
+    if (newPhotoItems.length > 0) {
+      setPhotos((prev) => [...prev, ...newPhotoItems]);
+    }
+    if (skippedCount > 0) {
+      setImportNotice(`破損または非対応のファイル ${skippedCount} 件をスキップしました。`);
+    }
     setIsAnalyzing(false);
+  };
+
+  const handleCancelImport = () => {
+    cancelImportRef.current = true;
   };
 
   const handleLoadDemo = async () => {
@@ -177,6 +221,7 @@ export const App: React.FC = () => {
     setGroups([]);
     setActiveGroupId(null);
     setFilter('all');
+    setImportNotice(null);
   };
 
   const handleDrop = async (e: React.DragEvent) => {
@@ -238,6 +283,16 @@ export const App: React.FC = () => {
   const handleToggleExcludeGroup = (groupId: string) => {
     setGroups((prev) =>
       prev.map((g) => (g.id === groupId ? { ...g, excluded: !g.excluded } : g))
+    );
+  };
+
+  const handleChangeGroupScene = (groupId: string, newScene: SceneType) => {
+    setGroups((prev) =>
+      prev.map((g) =>
+        g.id === groupId
+          ? recalculateGroupWithScene(g, newScene, settings.closeCallThreshold)
+          : g
+      )
     );
   };
 
@@ -354,7 +409,7 @@ export const App: React.FC = () => {
         isDark ? 'bg-[#121316] text-gray-100' : 'bg-gray-50 text-gray-900'
       }`}
     >
-      {/* シンプルなヘッダー */}
+      {/* ヘッダー */}
       <header
         className={`sticky top-0 z-30 border-b px-4 sm:px-6 h-14 flex items-center justify-between gap-3 ${
           isDark
@@ -508,7 +563,16 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* 読み込み中バー */}
+        {importNotice && (
+          <div className="p-3 rounded-lg bg-amber-950/60 border border-amber-700/50 text-amber-200 text-xs flex items-center justify-between">
+            <span>{importNotice}</span>
+            <button onClick={() => setImportNotice(null)} className="underline ml-3">
+              閉じる
+            </button>
+          </div>
+        )}
+
+        {/* 読み込み中バー（中断ボタン付き） */}
         {isAnalyzing && (
           <div
             className={`p-3.5 rounded-xl border space-y-2 ${
@@ -516,13 +580,22 @@ export const App: React.FC = () => {
             }`}
           >
             <div className="flex items-center justify-between text-xs">
-              <span className="flex items-center gap-2 font-medium">
-                <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+              <span className="flex items-center gap-2 font-medium truncate">
+                <Loader2 className="w-4 h-4 animate-spin text-blue-500 shrink-0" />
                 読み込み中: {analyzeProgress.fileName}
               </span>
-              <span className="font-mono text-gray-400">
-                {analyzeProgress.current} / {analyzeProgress.total}
-              </span>
+              <div className="flex items-center gap-3 shrink-0">
+                <span className="font-mono text-gray-400">
+                  {analyzeProgress.current} / {analyzeProgress.total}
+                </span>
+                <button
+                  onClick={handleCancelImport}
+                  className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 flex items-center gap-1 border border-gray-700"
+                >
+                  <XCircle className="w-3.5 h-3.5" />
+                  <span>中断</span>
+                </button>
+              </div>
             </div>
             <div className={`w-full h-1.5 rounded-full overflow-hidden ${isDark ? 'bg-gray-800' : 'bg-gray-200'}`}>
               <div
@@ -537,7 +610,7 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* 写真未選択時：シンプルで迷わないドロップエリア */}
+        {/* 写真未選択時 */}
         {photos.length === 0 && !isAnalyzing ? (
           <div className="py-12 sm:py-20 flex items-center justify-center">
             <div
@@ -612,7 +685,7 @@ export const App: React.FC = () => {
           </div>
         ) : null}
 
-        {/* 写真読み込み後：フィルター ＆ まとめ具合スライダー ＆ グリッド */}
+        {/* 写真読み込み後 */}
         {photos.length > 0 && (
           <>
             <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
@@ -664,7 +737,7 @@ export const App: React.FC = () => {
                 ))}
               </div>
 
-              {/* まとめ具合スライダー & AI一括判定 */}
+              {/* グループ化スライダー & AI一括判定 */}
               <div className="flex flex-wrap items-center gap-3">
                 <div
                   className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs ${
@@ -729,7 +802,6 @@ export const App: React.FC = () => {
                         : 'bg-white border-gray-200 hover:border-gray-400 shadow-xs'
                     }`}
                   >
-                    {/* 写真サムネイル */}
                     <div className="relative aspect-[3/2] bg-black overflow-hidden">
                       <img
                         src={primaryPhoto.thumbnailUrl}
@@ -737,7 +809,6 @@ export const App: React.FC = () => {
                         className="w-full h-full object-cover"
                       />
 
-                      {/* 左上：連写枚数・僅差・複数採用 */}
                       <div className="absolute top-2 left-2 flex flex-wrap items-center gap-1">
                         {group.photos.length > 1 && (
                           <span className="px-2 py-0.5 rounded text-[11px] font-medium bg-black/75 text-white backdrop-blur-xs">
@@ -759,7 +830,6 @@ export const App: React.FC = () => {
                         )}
                       </div>
 
-                      {/* 右上：RAW & スコア */}
                       <div className="absolute top-2 right-2 flex items-center gap-1">
                         {primaryPhoto.rawFileName && (
                           <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-black/75 text-amber-300 backdrop-blur-xs">
@@ -781,7 +851,6 @@ export const App: React.FC = () => {
                       )}
                     </div>
 
-                    {/* 下部メタ情報 & 連写候補サムネイル */}
                     <div className="p-3 flex-1 flex flex-col justify-between gap-2">
                       <div>
                         <div className="flex items-center justify-between gap-2">
@@ -808,7 +877,6 @@ export const App: React.FC = () => {
                         </p>
                       </div>
 
-                      {/* 連写グループ内の切り替えサムネイル */}
                       {group.photos.length > 1 ? (
                         <div
                           className={`pt-2 border-t flex items-center justify-between gap-1 ${
@@ -909,6 +977,7 @@ export const App: React.FC = () => {
         onSelectSingleBest={handleSelectSingleBest}
         onToggleMultiSelect={handleToggleMultiSelect}
         onToggleExcludeGroup={handleToggleExcludeGroup}
+        onChangeGroupScene={handleChangeGroupScene}
         onAskGemini={handleAskGeminiSingle}
       />
 
@@ -927,6 +996,7 @@ export const App: React.FC = () => {
         isOpen={isSettingsOpen}
         settings={settings}
         onUpdateSettings={updateSettings}
+        onClearCredentials={handleClearCredentials}
         onClose={() => setIsSettingsOpen(false)}
       />
 

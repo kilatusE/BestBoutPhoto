@@ -1,14 +1,12 @@
 import { Zip, ZipPassThrough } from 'fflate';
 import { PhotoGroup, PhotoItem } from '../types';
 import { copyAndProcessJpegExif } from './exifUtils';
+import { sanitizeFileName, sanitizeFolderName } from './securityUtils';
 
 export interface ProgressCallback {
   (info: { stage: string; current: number; total: number; fileName?: string }): void;
 }
 
-/**
- * グループ一覧から「採用された写真」の配列を取得する
- */
 export function getSelectedPhotos(groups: PhotoGroup[]): PhotoItem[] {
   const result: PhotoItem[] = [];
   for (const g of groups) {
@@ -23,9 +21,6 @@ export function getSelectedPhotos(groups: PhotoGroup[]): PhotoItem[] {
   return result;
 }
 
-/**
- * グループ一覧から「選外（ボツ）となった写真」の配列を取得する
- */
 export function getExcludedPhotos(groups: PhotoGroup[]): PhotoItem[] {
   const result: PhotoItem[] = [];
   for (const g of groups) {
@@ -43,14 +38,11 @@ export function getExcludedPhotos(groups: PhotoGroup[]): PhotoItem[] {
   return result;
 }
 
-/**
- * 1枚の写真を指定サイズ・品質・Exif/GPS設定で出力用Blobに変換する（ストリーミング1枚処理でメモリピーク抑制）
- */
 export async function preparePhotoBlob(
   photo: PhotoItem,
   options: {
-    maxDimension: number; // 0 = オリジナル無変換, 4096 = 長辺4096px
-    jpegQuality: number;  // 0.88 等
+    maxDimension: number;
+    jpegQuality: number;
     stripGps: boolean;
   }
 ): Promise<Blob> {
@@ -59,7 +51,6 @@ export async function preparePhotoBlob(
     photo.fileName.toLowerCase().endsWith('.jpg') ||
     photo.fileName.toLowerCase().endsWith('.jpeg');
 
-  // オリジナル画質（無変換）の場合
   if (options.maxDimension <= 0) {
     if (options.stripGps && isJpeg) {
       return copyAndProcessJpegExif(photo.file, photo.file, {
@@ -70,7 +61,6 @@ export async function preparePhotoBlob(
     return photo.file;
   }
 
-  // リサイズ処理（長辺 maxDimension px）
   let width = 0;
   let height = 0;
   const canvas = document.createElement('canvas');
@@ -81,7 +71,6 @@ export async function preparePhotoBlob(
     width = bitmap.width;
     height = bitmap.height;
 
-    // 元画像が指定サイズ以下かつGPS削除不要なら元ファイルをそのまま返す
     if (Math.max(width, height) <= options.maxDimension && !options.stripGps && isJpeg) {
       bitmap.close();
       return photo.file;
@@ -130,9 +119,6 @@ export async function preparePhotoBlob(
   return resizedBlob;
 }
 
-/**
- * PC（File System Access API 対応ブラウザ）で指定ディレクトリ配下にイベントフォルダを作成し直接保存する
- */
 export async function saveToLocalFolderDirect(
   photos: PhotoItem[],
   folderName: string,
@@ -156,11 +142,12 @@ export async function saveToLocalFolderDirect(
 
   for (const photo of photos) {
     currentStep++;
+    const safeImgName = sanitizeFileName(photo.fileName);
     onProgress?.({
-      stage: 'ローカルフォルダへ直接保存中',
+      stage: 'ローカルフォルダへ保存中',
       current: currentStep,
       total: totalSteps,
-      fileName: photo.fileName
+      fileName: safeImgName
     });
 
     const outBlob = await preparePhotoBlob(photo, {
@@ -169,20 +156,21 @@ export async function saveToLocalFolderDirect(
       stripGps: options.stripGps
     });
 
-    const fileHandle = await eventDirHandle.getFileHandle(photo.fileName, { create: true });
+    const fileHandle = await eventDirHandle.getFileHandle(safeImgName, { create: true });
     const writable = await fileHandle.createWritable();
     await writable.write(outBlob);
     await writable.close();
 
     if (options.includeRaw && photo.rawFile && photo.rawFileName) {
       currentStep++;
+      const safeRawName = sanitizeFileName(photo.rawFileName, 'raw.arw');
       onProgress?.({
         stage: 'RAWファイルを保存中',
         current: currentStep,
         total: totalSteps,
-        fileName: photo.rawFileName
+        fileName: safeRawName
       });
-      const rawHandle = await eventDirHandle.getFileHandle(photo.rawFileName, { create: true });
+      const rawHandle = await eventDirHandle.getFileHandle(safeRawName, { create: true });
       const rawWritable = await rawHandle.createWritable();
       await rawWritable.write(photo.rawFile);
       await rawWritable.close();
@@ -192,9 +180,6 @@ export async function saveToLocalFolderDirect(
   return true;
 }
 
-/**
- * ストリーミング無圧縮ZIP（ZipPassThrough）により高速・省メモリでイベントフォルダ入りZIPを生成・ダウンロードする
- */
 export async function downloadAsZip(
   photos: PhotoItem[],
   folderName: string,
@@ -216,14 +201,16 @@ export async function downloadAsZip(
 
   const totalSteps = photos.reduce((acc, p) => acc + 1 + (options.includeRaw && p.rawFile ? 1 : 0), 0);
   let currentStep = 0;
+  const usedEntryNames = new Set<string>();
 
   for (const photo of photos) {
     currentStep++;
+    const safeImgName = deduplicateFileName(sanitizeFileName(photo.fileName), usedEntryNames);
     onProgress?.({
-      stage: 'ZIPアーカイブ生成中',
+      stage: 'ZIP生成中',
       current: currentStep,
       total: totalSteps,
-      fileName: photo.fileName
+      fileName: safeImgName
     });
 
     const outBlob = await preparePhotoBlob(photo, {
@@ -232,20 +219,24 @@ export async function downloadAsZip(
       stripGps: options.stripGps
     });
     const bytes = new Uint8Array(await outBlob.arrayBuffer());
-    const entry = new ZipPassThrough(`${safeFolder}/${photo.fileName}`);
+    const entry = new ZipPassThrough(`${safeFolder}/${safeImgName}`);
     zip.add(entry);
     entry.push(bytes, true);
 
     if (options.includeRaw && photo.rawFile && photo.rawFileName) {
       currentStep++;
+      const safeRawName = deduplicateFileName(
+        sanitizeFileName(photo.rawFileName, 'raw.arw'),
+        usedEntryNames
+      );
       onProgress?.({
         stage: 'RAWファイルをZIPに追加中',
         current: currentStep,
         total: totalSteps,
-        fileName: photo.rawFileName
+        fileName: safeRawName
       });
       const rawBytes = new Uint8Array(await photo.rawFile.arrayBuffer());
-      const rawEntry = new ZipPassThrough(`${safeFolder}/${photo.rawFileName}`);
+      const rawEntry = new ZipPassThrough(`${safeFolder}/${safeRawName}`);
       zip.add(rawEntry);
       rawEntry.push(rawBytes, true);
     }
@@ -254,9 +245,22 @@ export async function downloadAsZip(
   zip.end();
 }
 
-/**
- * スマホの Web Share API (navigator.share) で Amazon Photos 等へ共有シート経由で直接渡す
- */
+function deduplicateFileName(name: string, used: Set<string>): string {
+  let candidate = name;
+  let counter = 1;
+  while (used.has(candidate.toLowerCase())) {
+    const dotIdx = name.lastIndexOf('.');
+    if (dotIdx > 0) {
+      candidate = `${name.slice(0, dotIdx)}_${counter}${name.slice(dotIdx)}`;
+    } else {
+      candidate = `${name}_${counter}`;
+    }
+    counter++;
+  }
+  used.add(candidate.toLowerCase());
+  return candidate;
+}
+
 export async function shareViaWebShareApi(
   photos: PhotoItem[],
   folderName: string,
@@ -271,11 +275,12 @@ export async function shareViaWebShareApi(
   let idx = 0;
   for (const photo of photos) {
     idx++;
+    const safeImgName = sanitizeFileName(photo.fileName);
     onProgress?.({
       stage: '共有用ファイルを準備中',
       current: idx,
       total: photos.length,
-      fileName: photo.fileName
+      fileName: safeImgName
     });
 
     const blob = await preparePhotoBlob(photo, {
@@ -283,7 +288,7 @@ export async function shareViaWebShareApi(
       jpegQuality: 1,
       stripGps: options.stripGps
     });
-    shareFiles.push(new File([blob], photo.fileName, { type: photo.file.type || 'image/jpeg' }));
+    shareFiles.push(new File([blob], safeImgName, { type: photo.file.type || 'image/jpeg' }));
 
     if (options.includeRaw && photo.rawFile && photo.rawFileName) {
       shareFiles.push(photo.rawFile);
@@ -295,16 +300,13 @@ export async function shareViaWebShareApi(
   }
 
   await navigator.share({
-    title: folderName,
-    text: `${folderName} (${shareFiles.length}ファイル)`,
+    title: sanitizeFolderName(folderName),
+    text: `${sanitizeFolderName(folderName)} (${shareFiles.length}ファイル)`,
     files: shareFiles
   });
   return true;
 }
 
-/**
- * Google Identity Services (OAuth 2.0) でアクセストークンを取得する
- */
 export function requestGoogleDriveAccessToken(clientId: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const g = (window as unknown as {
@@ -323,7 +325,7 @@ export function requestGoogleDriveAccessToken(clientId: string): Promise<string>
     }).google;
 
     if (!g?.accounts?.oauth2) {
-      reject(new Error('Google認証スクリプト(GSI)が読み込まれていません。ネットワーク接続を確認してください。'));
+      reject(new Error('Google認証スクリプトが読み込まれていません。通信環境を確認してください。'));
       return;
     }
 
@@ -338,7 +340,7 @@ export function requestGoogleDriveAccessToken(clientId: string): Promise<string>
         resolve(resp.access_token);
       },
       error_callback: (err) => {
-        reject(new Error(`Google認証ポップアップエラー: ${err?.message || 'キャンセルされました'}`));
+        reject(new Error(`Google認証がキャンセルされました (${err?.message || ''})`));
       }
     });
 
@@ -346,9 +348,6 @@ export function requestGoogleDriveAccessToken(clientId: string): Promise<string>
   });
 }
 
-/**
- * Google Drive API v3 でイベントフォルダを作成し、写真を1枚ずつリサイズ＆Exif保持してアップロードする
- */
 export async function uploadToGoogleDrive(
   photos: PhotoItem[],
   folderName: string,
@@ -364,7 +363,6 @@ export async function uploadToGoogleDrive(
 ): Promise<{ folderId: string; uploadedCount: number }> {
   const safeFolderName = sanitizeFolderName(folderName);
 
-  // 1. イベントフォルダを作成
   onProgress?.({
     stage: 'Google Drive にフォルダを作成中...',
     current: 0,
@@ -390,7 +388,7 @@ export async function uploadToGoogleDrive(
 
   if (!folderRes.ok) {
     const errText = await folderRes.text();
-    throw new Error(`Google Drive フォルダ作成失敗 (${folderRes.status}): ${errText}`);
+    throw new Error(`Google Drive フォルダ作成失敗 (${folderRes.status}): ${errText.slice(0, 180)}`);
   }
 
   const folderData = await folderRes.json();
@@ -401,11 +399,12 @@ export async function uploadToGoogleDrive(
 
   for (const photo of photos) {
     currentStep++;
+    const safeImgName = sanitizeFileName(photo.fileName);
     onProgress?.({
       stage: 'Google Drive へアップロード中',
       current: currentStep,
       total: totalSteps,
-      fileName: photo.fileName
+      fileName: safeImgName
     });
 
     const outBlob = await preparePhotoBlob(photo, {
@@ -417,26 +416,25 @@ export async function uploadToGoogleDrive(
     await uploadSingleFileToDrive(
       options.accessToken,
       targetFolderId,
-      photo.fileName,
-      outBlob,
-      'image/jpeg'
+      safeImgName,
+      outBlob
     );
 
     if (options.includeRaw && photo.rawFile && photo.rawFileName) {
       currentStep++;
+      const safeRawName = sanitizeFileName(photo.rawFileName, 'raw.arw');
       onProgress?.({
-        stage: 'RAWファイルを Google Drive へアップロード中',
+        stage: 'RAWファイルをアップロード中',
         current: currentStep,
         total: totalSteps,
-        fileName: photo.rawFileName
+        fileName: safeRawName
       });
 
       await uploadSingleFileToDrive(
         options.accessToken,
         targetFolderId,
-        photo.rawFileName,
-        photo.rawFile,
-        'application/octet-stream'
+        safeRawName,
+        photo.rawFile
       );
     }
   }
@@ -448,8 +446,7 @@ async function uploadSingleFileToDrive(
   accessToken: string,
   parentId: string,
   fileName: string,
-  blob: Blob,
-  mimeType: string
+  blob: Blob
 ): Promise<void> {
   const metadata = {
     name: fileName,
@@ -470,43 +467,36 @@ async function uploadSingleFileToDrive(
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`ファイル "${fileName}" のアップロード失敗 (${res.status}): ${errText}`);
+    throw new Error(`"${fileName}" のアップロード失敗 (${res.status}): ${errText.slice(0, 180)}`);
   }
 }
 
-/**
- * 除外（ボツ）写真リスト (excluded_files.txt) を生成してダウンロードする
- */
 export function downloadExcludedFilesList(groups: PhotoGroup[], folderName: string): void {
   const excludedPhotos = getExcludedPhotos(groups);
+  const safeFolder = sanitizeFolderName(folderName);
   const lines: string[] = [
-    `# BestBout Photo 選外（除外）ファイル一覧 - ${folderName}`,
+    `# BestBout Photo 不採用ファイル一覧 - ${safeFolder}`,
     `# 生成日時: ${new Date().toLocaleString('ja-JP')}`,
-    `# 選外枚数: ${excludedPhotos.length} 枚`,
+    `# 枚数: ${excludedPhotos.length} 枚`,
     ''
   ];
 
   for (const p of excludedPhotos) {
-    lines.push(p.fileName);
+    lines.push(sanitizeFileName(p.fileName));
     if (p.rawFileName) {
-      lines.push(p.rawFileName);
+      lines.push(sanitizeFileName(p.rawFileName));
     }
   }
 
   const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-  triggerBlobDownload(blob, `excluded_files_${sanitizeFolderName(folderName)}.txt`);
-}
-
-function sanitizeFolderName(name: string): string {
-  const trimmed = name.trim().replace(/[\\/:*?"<>|]/g, '_');
-  return trimmed || 'BestBout_Export';
+  triggerBlobDownload(blob, `excluded_files_${safeFolder}.txt`);
 }
 
 function triggerBlobDownload(blob: Blob, fileName: string): void {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = fileName;
+  a.download = sanitizeFileName(fileName, 'download.zip');
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

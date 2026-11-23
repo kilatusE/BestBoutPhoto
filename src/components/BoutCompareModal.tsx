@@ -11,10 +11,10 @@ import {
   ChevronLeft,
   ChevronRight,
   MapPin,
-  Loader2
+  Loader2,
+  AlertTriangle
 } from 'lucide-react';
-import { PhotoGroup, PhotoItem } from '../types';
-import { SCENE_META } from '../utils/groupingEngine';
+import { PhotoGroup, PhotoItem, SceneType } from '../types';
 import { formatShutterSpeed } from '../utils/exifUtils';
 
 interface BoutCompareModalProps {
@@ -29,6 +29,7 @@ interface BoutCompareModalProps {
   onSelectSingleBest: (groupId: string, photoId: string) => void;
   onToggleMultiSelect: (groupId: string, photoIdA: string, photoIdB: string) => void;
   onToggleExcludeGroup: (groupId: string) => void;
+  onChangeGroupScene: (groupId: string, newScene: SceneType) => void;
   onAskGemini: (group: PhotoGroup) => void;
 }
 
@@ -43,6 +44,7 @@ export const BoutCompareModal: React.FC<BoutCompareModalProps> = ({
   onSelectSingleBest,
   onToggleMultiSelect,
   onToggleExcludeGroup,
+  onChangeGroupScene,
   onAskGemini
 }) => {
   const [leftIdx, setLeftIdx] = useState(0);
@@ -95,7 +97,13 @@ export const BoutCompareModal: React.FC<BoutCompareModalProps> = ({
     if (!group) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
 
       switch (e.key) {
         case '1':
@@ -197,8 +205,6 @@ export const BoutCompareModal: React.FC<BoutCompareModalProps> = ({
     setIsDragging(false);
   };
 
-  const sceneMeta = SCENE_META[group.scene];
-
   return (
     <div className="fixed inset-0 z-50 bg-[#0D0E11] flex flex-col select-none">
       {/* 上部バー */}
@@ -224,7 +230,18 @@ export const BoutCompareModal: React.FC<BoutCompareModalProps> = ({
             <ChevronRight className="w-4 h-4" />
           </button>
 
-          <span className="text-xs text-gray-400 ml-1">{sceneMeta.label}</span>
+          {/* シーン手動切り替え（切り替え時は即座にその基準で再採点） */}
+          <select
+            value={group.scene}
+            onChange={(e) => onChangeGroupScene(group.id, e.target.value as SceneType)}
+            className="ml-1 px-2 py-1 rounded bg-gray-900 border border-gray-700 text-xs text-gray-200 focus:outline-none focus:border-blue-500"
+            title="評価基準シーンを変更して再採点"
+          >
+            <option value="portrait">人物</option>
+            <option value="food">料理・モノ</option>
+            <option value="landscape">風景</option>
+            <option value="document">資料</option>
+          </select>
 
           {group.isCloseCall && (
             <span className="px-2 py-0.5 text-[11px] font-semibold rounded bg-amber-500 text-black">
@@ -478,13 +495,24 @@ function renderPhotoPane(params: {
     >
       {/* 上部ラベル */}
       <div className="absolute top-2.5 left-2.5 right-2.5 z-10 flex items-center justify-between pointer-events-none">
-        <div className="flex items-center gap-2 bg-black/75 backdrop-blur-xs px-2.5 py-1 rounded-lg">
+        <div className="flex flex-wrap items-center gap-2 bg-black/75 backdrop-blur-xs px-2.5 py-1 rounded-lg">
           <span className="text-xs font-semibold text-white">{rankLabel}</span>
           <span className="text-xs font-mono text-gray-300">{photo.fileName}</span>
           <span className="text-xs font-mono text-blue-300">{photo.score.total}点</span>
           {photo.rawFileName && (
             <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-amber-500/20 text-amber-300">
               RAW
+            </span>
+          )}
+          {photo.metrics.faceCount > 0 && (
+            <span className="px-1.5 py-0.5 text-[10px] font-medium rounded bg-blue-500/20 text-blue-200">
+              瞳ピント {photo.metrics.eyeRegionSharpness} / 目開き {photo.metrics.eyeOpenScore}
+            </span>
+          )}
+          {photo.metrics.isBlinking && (
+            <span className="px-1.5 py-0.5 text-[10px] font-semibold rounded bg-rose-500/80 text-white flex items-center gap-0.5">
+              <AlertTriangle className="w-2.5 h-2.5" />
+              目つぶり注意
             </span>
           )}
         </div>

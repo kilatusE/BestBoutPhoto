@@ -37,6 +37,18 @@ let visionEnginePromise: Promise<{
   detector: FaceDetector | null;
 }> | null = null;
 
+// WebGL/WASM推論の同時呼び出しによるコンテキスト競合・検出漏れを防ぐ非同期ミューテックスキュー
+let visionMutexChain: Promise<void> = Promise.resolve();
+
+function runWithVisionLock<T>(task: () => Promise<T>): Promise<T> {
+  const resultPromise = visionMutexChain.then(task, task);
+  visionMutexChain = resultPromise.then(
+    () => undefined,
+    () => undefined
+  );
+  return resultPromise;
+}
+
 /**
  * MediaPipe FaceLandmarker (478点3Dメッシュ+52表情Blendshape) と
  * FaceDetector (横顔・マスク・小顔に強いBlazeFace) をシングルトン初期化する
@@ -96,7 +108,18 @@ export function getVisionEngines(): Promise<{
  * 1024pxサムネイルCanvasで顔・瞳の座標と表情・目開きを検出し、
  * 元画像のフル解像度ソース (fullResSource) から等倍(1:1)で瞳・まつ毛のガチピントを計測する
  */
-export async function analyzeFacesOnCanvas(
+export function analyzeFacesOnCanvas(
+  thumbCanvas: HTMLCanvasElement,
+  fullResSource?: CanvasImageSource,
+  fullResWidth?: number,
+  fullResHeight?: number
+): Promise<PortraitAnalysisResult> {
+  return runWithVisionLock(() =>
+    analyzeFacesOnCanvasInternal(thumbCanvas, fullResSource, fullResWidth, fullResHeight)
+  );
+}
+
+async function analyzeFacesOnCanvasInternal(
   thumbCanvas: HTMLCanvasElement,
   fullResSource?: CanvasImageSource,
   fullResWidth?: number,
