@@ -47,8 +47,8 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
     } catch (err) {
       setErrorMsg(
         err instanceof Error
-          ? `カメラにアクセスできませんでした: ${err.message}`
-          : 'カメラの起動に失敗しました。ブラウザのカメラ権限を確認してください。'
+          ? `カメラを起動できませんでした: ${err.message}`
+          : 'カメラのアクセス権限を確認してください。'
       );
     }
   };
@@ -113,24 +113,21 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 backdrop-blur-sm p-3">
-      <div className="relative w-full max-w-2xl rounded-2xl bg-[#181B20] border border-gray-700/70 shadow-2xl overflow-hidden flex flex-col">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3">
+      <div className="relative w-full max-w-xl rounded-xl bg-[#181A1F] border border-gray-800 shadow-2xl overflow-hidden flex flex-col">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
-          <div className="flex items-center gap-2 text-white font-semibold">
-            <Camera className="w-5 h-5 text-indigo-400" />
-            <span>アプリ内カメラ撮影（単写 / 4連写バウト用）</span>
-          </div>
+          <span className="text-sm font-semibold text-white">カメラ撮影</span>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800"
+            className="p-1 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800"
           >
-            <X className="w-5 h-5" />
+            <X className="w-4 h-4" />
           </button>
         </div>
 
         <div className="relative bg-black aspect-video flex items-center justify-center overflow-hidden">
           {errorMsg ? (
-            <div className="text-center p-6 text-rose-400 text-sm">{errorMsg}</div>
+            <div className="text-center p-6 text-rose-400 text-xs">{errorMsg}</div>
           ) : (
             <video
               ref={videoRef}
@@ -142,52 +139,51 @@ export const CameraCaptureModal: React.FC<CameraCaptureModalProps> = ({
           )}
 
           {isBursting && (
-            <div className="absolute top-3 left-3 px-3 py-1 rounded-full bg-amber-500 text-black font-bold text-xs animate-pulse flex items-center gap-1">
-              <Zap className="w-3.5 h-3.5" />
-              高速4連写中...
+            <div className="absolute top-3 left-3 px-2.5 py-1 rounded bg-amber-500 text-black font-semibold text-xs">
+              連写中...
             </div>
           )}
 
           <button
             onClick={() => setFacingMode((m) => (m === 'environment' ? 'user' : 'environment'))}
-            className="absolute top-3 right-3 px-3 py-1.5 rounded-lg bg-black/60 hover:bg-black/80 text-white text-xs flex items-center gap-1.5 border border-white/15"
+            className="absolute top-3 right-3 px-2.5 py-1 rounded-lg bg-black/60 hover:bg-black/80 text-white text-xs flex items-center gap-1"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            カメラ切替
+            切替
           </button>
         </div>
 
-        <div className="p-4 flex flex-col sm:flex-row items-center justify-between gap-3 bg-[#12151A]">
-          <div className="text-sm text-gray-300">
-            撮影済み: <span className="font-bold text-indigo-400">{capturedFiles.length}</span> 枚
+        <div className="p-3.5 flex items-center justify-between gap-2 bg-[#121316]">
+          <div className="text-xs text-gray-400">
+            撮影枚数: <span className="text-white font-medium">{capturedFiles.length}</span>
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2">
             <button
               onClick={handleSingleShot}
               disabled={Boolean(errorMsg) || isBursting}
-              className="px-4 py-2 rounded-xl bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-white font-medium text-sm flex items-center gap-1.5 border border-gray-600"
+              className="px-3.5 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-white text-xs font-medium flex items-center gap-1.5 border border-gray-700"
             >
-              <Camera className="w-4 h-4" />
-              1枚撮影
+              <Camera className="w-3.5 h-3.5" />
+              撮影
             </button>
 
             <button
               onClick={handleBurstShot}
               disabled={Boolean(errorMsg) || isBursting}
-              className="px-4 py-2 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 disabled:opacity-40 text-amber-300 font-semibold text-sm flex items-center gap-1.5 border border-amber-500/40"
+              className="px-3.5 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-200 text-xs font-medium flex items-center gap-1.5 border border-gray-700"
             >
-              <Zap className="w-4 h-4" />
-              4連写撮影
+              <Zap className="w-3.5 h-3.5 text-amber-400" />
+              4連写
             </button>
 
             <button
               onClick={handleComplete}
               disabled={capturedFiles.length === 0}
-              className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-semibold text-sm flex items-center gap-1.5 shadow-lg shadow-indigo-600/30"
+              className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium flex items-center gap-1.5"
             >
-              <Check className="w-4 h-4" />
-              取り込んで解析 ({capturedFiles.length})
+              <Check className="w-3.5 h-3.5" />
+              取り込む ({capturedFiles.length})
             </button>
           </div>
         </div>
