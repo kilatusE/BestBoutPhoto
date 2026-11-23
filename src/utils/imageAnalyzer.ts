@@ -1,5 +1,6 @@
 import { PhotoItem, RawImageMetrics, SceneType, ScoreBreakdown } from '../types';
 import { extractExif } from './exifUtils';
+import { analyzeFacesOnCanvas, PortraitAnalysisResult } from './faceDetector';
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'avif']);
 const RAW_EXTENSIONS = new Set(['arw', 'cr2', 'cr3', 'nef', 'nrw', 'dng', 'raf', 'orf', 'rw2', 'pef', 'srw']);
@@ -10,9 +11,6 @@ export interface PairedFileEntry {
   rawFile?: File;
 }
 
-/**
- * 取り込まれたFileリストからJPEG/画像とRAW(.ARW等)を拡張子を除いたファイル名で自動ペアリングする
- */
 export function pairImportedFiles(files: File[], enableRawPairing: boolean): PairedFileEntry[] {
   const imageMap = new Map<string, File>();
   const rawMap = new Map<string, File>();
@@ -25,11 +23,9 @@ export function pairImportedFiles(files: File[], enableRawPairing: boolean): Pai
 
     const baseName = file.name.slice(0, dotIdx);
     const ext = file.name.slice(dotIdx + 1).toLowerCase();
-    // フォルダ階層がある場合も考慮しつつ、同一ファイル名ベースでマッチング
     const key = baseName.toLowerCase();
 
     if (IMAGE_EXTENSIONS.has(ext)) {
-      // 同名がある場合はサイズが大きい方または後勝ち
       imageMap.set(key, file);
     } else if (RAW_EXTENSIONS.has(ext)) {
       rawMap.set(key, file);
@@ -50,17 +46,12 @@ export function pairImportedFiles(files: File[], enableRawPairing: boolean): Pai
   return standaloneImages;
 }
 
-/**
- * 50MP級の高画素画像でもメモリパンクしないよう、1枚ずつ長辺1024pxサムネイルと解析特徴量を生成し、
- * フル解像度Bitmapを即座に破棄する
- */
 export async function analyzePhotoEntry(
   entry: PairedFileEntry,
   index: number
 ): Promise<PhotoItem> {
   const { imageFile, rawFile, baseName } = entry;
 
-  // 1. Exif抽出 と 画像デコード（1024px縮小）を並列実行
   const [exifFromHeader, thumbResult] = await Promise.all([
     extractExif(imageFile),
     createThumbnailAndAnalysisData(imageFile, 1024)
@@ -109,14 +100,14 @@ async function createThumbnailAndAnalysisData(
   file: File,
   maxThumbDim = 1024
 ): Promise<ThumbnailAnalysisResult> {
-  // createImageBitmap が使える場合は高速デコードし、描画後に close() で即座にメモリ解放
   let originalWidth = 0;
   let originalHeight = 0;
   let thumbWidth = 0;
   let thumbHeight = 0;
 
   const thumbCanvas = document.createElement('canvas');
-  const thumbCtx = thumbCanvas.getContext('2d', { willReadFrequently: false })!;
+  const thumbCtx = thumbCanvas.getContext('2d', { willReadFrequently: true })!;
+  let portraitResult: PortraitAnalysisResult;
 
   if ('createImageBitmap' in window) {
     const bitmap = await createImageBitmap(file);
@@ -128,7 +119,15 @@ async function createThumbnailAndAnalysisData(
     thumbCanvas.width = thumbWidth;
     thumbCanvas.height = thumbHeight;
     thumbCtx.drawImage(bitmap, 0, 0, thumbWidth, thumbHeight);
-    bitmap.close(); // 50MPフル解像度メモリを即解放
+
+    // フル解像度bitmapを破棄する直前に、検出された瞳・顔領域のみフル解像度(1:1等倍)でピント計測
+    portraitResult = await analyzeFacesOnCanvas(
+      thumbCanvas,
+      bitmap,
+      originalWidth,
+      originalHeight
+    );
+    bitmap.close();
   } else {
     const img = await loadImageElement(file);
     originalWidth = img.naturalWidth || img.width;
@@ -139,18 +138,26 @@ async function createThumbnailAndAnalysisData(
     thumbCanvas.width = thumbWidth;
     thumbCanvas.height = thumbHeight;
     thumbCtx.drawImage(img, 0, 0, thumbWidth, thumbHeight);
+
+    portraitResult = await analyzeFacesOnCanvas(
+      thumbCanvas,
+      img,
+      originalWidth,
+      originalHeight
+    );
   }
 
-  // サムネイルBlob URL生成
+  // 1. サムネイルBlob URL生成
   const thumbBlob = await new Promise<Blob>((resolve) => {
     thumbCanvas.toBlob((b) => resolve(b || new Blob()), 'image/jpeg', 0.85);
   });
+
   const thumbnailUrl = URL.createObjectURL(thumbBlob);
 
-  // 2. dHash (9x8 グレースケール差分ハッシュ = 64bit)
+  // 2. dHash (64bit)
   const dHash = computeDHash(thumbCanvas);
 
-  // 3. 解析用キャンバス（長辺256px）で色ヒストグラム・シャープネス・顔/被写体領域・露出・水平を計測
+  // 3. 全体統計・色ヒストグラム解析（長辺256px）
   const analysisScale = Math.min(1, 256 / Math.max(thumbWidth, thumbHeight));
   const aW = Math.max(32, Math.round(thumbWidth * analysisScale));
   const aH = Math.max(32, Math.round(thumbHeight * analysisScale));
@@ -162,9 +169,8 @@ async function createThumbnailAndAnalysisData(
   const imgData = aCtx.getImageData(0, 0, aW, aH);
 
   const colorHist = computeColorHistogram(imgData.data);
-  const metrics = analyzePixels(imgData.data, aW, aH);
+  const metrics = analyzePixelsWithPortrait(imgData.data, aW, aH, portraitResult);
 
-  // メモリ解放補助
   thumbCanvas.width = 0;
   thumbCanvas.height = 0;
   aCanvas.width = 0;
@@ -198,9 +204,6 @@ function loadImageElement(file: File): Promise<HTMLImageElement> {
   });
 }
 
-/**
- * 9x8 縮小画像から64bitのdHash文字列（'0'/'1'の64文字）を生成
- */
 function computeDHash(sourceCanvas: HTMLCanvasElement): string {
   const c = document.createElement('canvas');
   c.width = 9;
@@ -222,9 +225,6 @@ function computeDHash(sourceCanvas: HTMLCanvasElement): string {
   return bits;
 }
 
-/**
- * 48ビン（R:16, G:16, B:16）の正規化カラーヒストグラムを計算
- */
 function computeColorHistogram(data: Uint8ClampedArray): number[] {
   const bins = new Array<number>(48).fill(0);
   const totalPixels = data.length / 4;
@@ -240,12 +240,16 @@ function computeColorHistogram(data: Uint8ClampedArray): number[] {
 }
 
 /**
- * ピクセル統計・Laplacianシャープネス・肌色/顔候補領域・目開き度・文字エッジ密度・露出・水平度を解析
+ * 全体画像統計と MediaPipe Face Landmarker の1024px顔・瞳解析結果を統合
  */
-function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageMetrics {
+function analyzePixelsWithPortrait(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number,
+  portrait: PortraitAnalysisResult
+): RawImageMetrics {
   const total = w * h;
   const gray = new Float32Array(total);
-  const skinMask = new Uint8Array(total);
 
   let sumLum = 0;
   let sumLumSq = 0;
@@ -255,9 +259,6 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
   let whiteBgPixels = 0;
   let warmPixels = 0;
   let skinPixels = 0;
-
-  // 肌色領域の重心とバウンディングボックス
-  let skinMinX = w, skinMaxX = 0, skinMinY = h, skinMaxY = 0;
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
@@ -281,48 +282,26 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
       const sat = maxC === 0 ? 0 : (delta / maxC) * 100;
       sumSat += sat;
 
-      // 白地・単色書類背景判定（高輝度・低彩度）
       if (lum > 185 && sat < 18) {
         whiteBgPixels++;
       }
 
-      // 暖色判定（料理・紅葉・夕景など）
       if (r > g && g >= b * 0.85 && sat > 22 && lum > 35 && lum < 235) {
         warmPixels++;
       }
 
-      // YCbCr による肌色領域検出（人物の顔・肌の検出）
       const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
       const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
-      const isCenterish = x > w * 0.12 && x < w * 0.88 && y > h * 0.08 && y < h * 0.85;
-      if (
-        isCenterish &&
-        lum > 45 &&
-        lum < 235 &&
-        cr >= 135 &&
-        cr <= 175 &&
-        cb >= 85 &&
-        cb <= 128 &&
-        r > g &&
-        r > b
-      ) {
-        skinMask[idx] = 1;
+      if (lum > 45 && lum < 235 && cr >= 135 && cr <= 173 && cb >= 88 && cb <= 125) {
         skinPixels++;
-        if (x < skinMinX) skinMinX = x;
-        if (x > skinMaxX) skinMaxX = x;
-        if (y < skinMinY) skinMinY = y;
-        if (y > skinMaxY) skinMaxY = y;
       }
     }
   }
 
-  // エッジ・Laplacianシャープネス・テキストエッジ密度・水平傾き解析
   let globalLapSum = 0;
   let globalCount = 0;
   let centerLapSum = 0;
   let centerCount = 0;
-  let faceLapSum = 0;
-  let faceLapCount = 0;
   let sharpTextEdges = 0;
   let alignedEdges = 0;
   let tiltedEdges = 0;
@@ -331,19 +310,6 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
   const cX1 = Math.ceil(w * 0.75);
   const cY0 = Math.floor(h * 0.25);
   const cY1 = Math.ceil(h * 0.75);
-
-  const skinRatio = skinPixels / total;
-  const hasFaceCandidate =
-    skinRatio >= 0.035 &&
-    skinRatio <= 0.55 &&
-    skinMaxX > skinMinX + w * 0.06 &&
-    skinMaxY > skinMinY + h * 0.06;
-
-  // 顔の上半分（目・眉の領域）のコントラストから目開き度・表情を推定
-  let eyeRegionEdgeSum = 0;
-  let eyeRegionCount = 0;
-  const eyeY0 = hasFaceCandidate ? skinMinY + Math.floor((skinMaxY - skinMinY) * 0.18) : 0;
-  const eyeY1 = hasFaceCandidate ? skinMinY + Math.floor((skinMaxY - skinMinY) * 0.52) : 0;
 
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
@@ -359,30 +325,15 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
         centerCount++;
       }
 
-      if (hasFaceCandidate && x >= skinMinX && x <= skinMaxX && y >= skinMinY && y <= skinMaxY) {
-        faceLapSum += lap;
-        faceLapCount++;
-        if (y >= eyeY0 && y <= eyeY1) {
-          // 瞳・まつ毛・黒目のエッジ（縦方向＋横方向の急峻な輝度変化）
-          const dy = Math.abs(gray[idx + w] - gray[idx - w]);
-          const dx = Math.abs(gray[idx + 1] - gray[idx - 1]);
-          eyeRegionEdgeSum += dy * 1.4 + dx * 0.8;
-          eyeRegionCount++;
-        }
-      }
-
-      // 文字らしい高コントラストエッジ
       if (lap > 38) {
         sharpTextEdges++;
       }
 
-      // 水平・垂直エッジの傾きチェック（風景の水平線・建物の垂直線）
       const gx = gray[idx + 1] - gray[idx - 1];
       const gy = gray[idx + w] - gray[idx - w];
       const mag = Math.hypot(gx, gy);
       if (mag > 28) {
-        const angle = Math.abs(Math.atan2(gy, gx) * (180 / Math.PI)); // 0〜180
-        // 完全水平(90度付近)または完全垂直(0/180度付近)からのズレ
+        const angle = Math.abs(Math.atan2(gy, gx) * (180 / Math.PI));
         const distFromAxis = Math.min(angle, Math.abs(90 - angle), Math.abs(180 - angle));
         if (distFromAxis <= 4) {
           alignedEdges++;
@@ -395,27 +346,12 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
 
   const rawGlobalLap = globalCount > 0 ? globalLapSum / globalCount : 0;
   const rawCenterLap = centerCount > 0 ? centerLapSum / centerCount : 0;
-  const rawFaceLap = faceLapCount > 0 ? faceLapSum / faceLapCount : rawCenterLap;
 
-  // 0〜100のスコアに正規化（一般的な写真のLaplacian平均 6〜24 を 45〜98 にマッピング）
-  const normalizeSharpness = (val: number) => Math.min(100, Math.max(15, Math.round((1 - Math.exp(-val / 11)) * 102)));
+  const normalizeSharpness = (val: number) =>
+    Math.min(100, Math.max(15, Math.round((1 - Math.exp(-val / 11)) * 102)));
 
   const globalSharpness = normalizeSharpness(rawGlobalLap);
   const centerSharpness = normalizeSharpness(rawCenterLap);
-  const faceRegionSharpness = normalizeSharpness(rawFaceLap * 1.15);
-
-  const eyeRaw = eyeRegionCount > 0 ? eyeRegionEdgeSum / eyeRegionCount : 18;
-  const eyeOpenScore = hasFaceCandidate
-    ? Math.min(100, Math.max(25, Math.round(40 + eyeRaw * 2.2)))
-    : 75;
-
-  // 顔の位置・左右バランスから正面度・表情スコアを算出
-  let smileOrFrontalScore = 75;
-  if (hasFaceCandidate) {
-    const faceCenterX = (skinMinX + skinMaxX) / (2 * w);
-    const centerBias = 1 - Math.min(1, Math.abs(faceCenterX - 0.5) * 2.2);
-    smileOrFrontalScore = Math.min(98, Math.max(45, Math.round(62 + centerBias * 22 + (eyeOpenScore - 60) * 0.35)));
-  }
 
   const meanLum = sumLum / total;
   const varianceLum = Math.max(0, sumLumSq / total - meanLum * meanLum);
@@ -428,17 +364,22 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
 
   const axisTotal = alignedEdges + tiltedEdges;
   const horizonStraightness =
-    axisTotal > 20 ? Math.min(100, Math.max(40, Math.round(55 + (alignedEdges / axisTotal) * 45))) : 82;
+    axisTotal > 20
+      ? Math.min(100, Math.max(40, Math.round(55 + (alignedEdges / axisTotal) * 45)))
+      : 82;
 
   return {
     globalSharpness,
     centerSharpness,
-    faceRegionSharpness,
-    faceCount: hasFaceCandidate ? 1 : 0,
-    faceAreaRatio: hasFaceCandidate ? skinRatio : 0,
-    eyeOpenScore,
-    smileOrFrontalScore,
-    skinToneRatio: skinRatio,
+    faceRegionSharpness: portrait.detected ? portrait.aggregatedFaceSharpness : centerSharpness,
+    eyeRegionSharpness: portrait.detected ? portrait.aggregatedEyeSharpness : centerSharpness,
+    faceCount: portrait.faceCount,
+    faceAreaRatio: portrait.totalFaceAreaRatio,
+    eyeOpenScore: portrait.detected ? portrait.aggregatedEyeOpenScore : 75,
+    isBlinking: portrait.detected ? portrait.anyFaceBlinking : false,
+    smileOrFrontalScore: portrait.detected ? portrait.aggregatedExpressionScore : 75,
+    faceExposureScore: portrait.detected ? portrait.aggregatedFaceExposure : 78,
+    skinToneRatio: skinPixels / total,
     whiteBgRatio: whiteBgPixels / total,
     textEdgeDensity,
     warmColorRatio: warmPixels / total,
@@ -452,20 +393,20 @@ function analyzePixels(data: Uint8ClampedArray, w: number, h: number): RawImageM
 }
 
 /**
- * SPEC 4.3 に基づき、画像の統計・特徴からシーンを自動判別する
+ * MediaPipe Face Landmarker の検出結果を最優先してシーンを分類する
  */
 export function classifyScene(m: RawImageMetrics): SceneType {
-  // 1. 資料・メモ: 白地/単色背景比が高く、文字エッジ密度が高く、彩度が低い
+  // 1. MediaPipe Face Landmarker で顔が1人以上検出された場合は、全身・アップ問わず確実に「人物」と判定
+  if (m.faceCount > 0 && m.faceAreaRatio >= 0.0012 && m.whiteBgRatio < 0.72) {
+    return 'portrait';
+  }
+
+  // 2. 資料・メモ: 白地/単色背景比が高く、文字エッジ密度が高く、彩度が低い
   if (m.whiteBgRatio >= 0.36 && m.saturationMean <= 26 && m.textEdgeDensity >= 18) {
     return 'document';
   }
 
-  // 2. 人物・ペット: 一定サイズ以上の顔・肌領域があり、かつ中央〜上部に被写体がある
-  if (m.faceCount > 0 && m.faceAreaRatio >= 0.045 && m.whiteBgRatio < 0.45) {
-    return 'portrait';
-  }
-
-  // 3. 料理・モノ: 中央被写体フォーカスが強く（背景ボケ）、暖色または高彩度傾向
+  // 3. 料理・モノ: 中央被写体フォーカスが強く、暖色または高彩度傾向
   const centerFocusRatio = m.centerSharpness / Math.max(1, m.globalSharpness);
   if (
     (centerFocusRatio >= 1.08 && (m.warmColorRatio >= 0.16 || m.saturationMean >= 32)) ||
@@ -474,24 +415,25 @@ export function classifyScene(m: RawImageMetrics): SceneType {
     return 'food';
   }
 
-  // 4. 風景・建物: 上記以外
+  // 4. 風景・建物
   return 'landscape';
 }
 
 /**
- * SPEC 4.3 のシーン別重み付けに基づき、0〜100点のスコアと内訳・評価理由を算出する
+ * シーン別の重み付けスコア算出。
+ * 人物シーンでは 1024px での「瞳ピント」「目開き(EAR+Blendshape)」「笑顔・正面度」「顔露出」で高精度に採点する。
  */
 export function calculateSceneScore(scene: SceneType, m: RawImageMetrics): ScoreBreakdown {
-  // 露出スコア（白飛び・黒つぶれペナルティ＋適正輝度評価）
   const overPenalty = Math.min(45, m.overExposedRatio * 180);
   const underPenalty = Math.min(45, m.underExposedRatio * 180);
   const brightnessDiff = Math.abs(m.brightnessMean - 52);
-  const exposure = Math.max(
+  const globalExposure = Math.max(
     20,
     Math.min(100, Math.round(94 - overPenalty - underPenalty - Math.max(0, brightnessDiff - 14) * 0.7))
   );
 
   let sharpness = m.globalSharpness;
+  let exposure = globalExposure;
   let subjectQuality = 75;
   let composition = 78;
   let total = 75;
@@ -499,19 +441,44 @@ export function calculateSceneScore(scene: SceneType, m: RawImageMetrics): Score
 
   switch (scene) {
     case 'portrait': {
-      sharpness = Math.round(m.faceRegionSharpness * 0.7 + m.centerSharpness * 0.3);
-      subjectQuality = Math.round(m.eyeOpenScore * 0.6 + m.smileOrFrontalScore * 0.4);
-      composition = Math.round(m.contrastScore * 0.5 + Math.min(100, m.saturationMean * 1.6) * 0.5);
-      total = sharpness * 0.42 + subjectQuality * 0.33 + exposure * 0.15 + composition * 0.1;
+      // 瞳(まつ毛・虹彩)のピントを65%、顔全体のシャープネスを35%で評価
+      sharpness =
+        m.faceCount > 0
+          ? Math.round(m.eyeRegionSharpness * 0.65 + m.faceRegionSharpness * 0.35)
+          : Math.round(m.centerSharpness * 0.75 + m.globalSharpness * 0.25);
 
-      if (m.eyeOpenScore < 52) {
-        primaryReason = '目つぶり・まばたきの可能性あり（減点）';
-      } else if (sharpness >= 82 && subjectQuality >= 80) {
-        primaryReason = '顔・瞳のピントがシャープで表情も良好';
-      } else if (sharpness >= 75) {
-        primaryReason = '被写体へのピントと露出バランスが安定';
+      // 目開き度(62%) + 表情・正面度(38%)
+      subjectQuality = Math.round(m.eyeOpenScore * 0.62 + m.smileOrFrontalScore * 0.38);
+
+      // 逆光でも顔の明るさが適正なら高評価になるよう顔領域の露出を75%重視
+      exposure =
+        m.faceCount > 0
+          ? Math.round(m.faceExposureScore * 0.75 + globalExposure * 0.25)
+          : globalExposure;
+
+      composition = Math.round(m.smileOrFrontalScore * 0.55 + m.contrastScore * 0.45);
+
+      // 目つぶり検出時は大きく減点して確実にベストから外す
+      const blinkPenalty = m.isBlinking ? 14 : m.eyeOpenScore < 55 ? (55 - m.eyeOpenScore) * 0.6 : 0;
+
+      total =
+        sharpness * 0.44 +
+        subjectQuality * 0.34 +
+        exposure * 0.14 +
+        composition * 0.08 -
+        blinkPenalty;
+
+      if (m.isBlinking || m.eyeOpenScore < 48) {
+        primaryReason = '目つぶり・まばたき検出（減点）';
+      } else if (m.eyeRegionSharpness >= 80 && m.eyeOpenScore >= 75) {
+        primaryReason =
+          m.faceCount > 1
+            ? `${m.faceCount}人の瞳にピントが合い、目開き・表情が良好`
+            : '瞳にピントが合い、目開き・表情が良好';
+      } else if (sharpness >= 74) {
+        primaryReason = '顔へのピントと肌の明るさが良好';
       } else {
-        primaryReason = '被写体のわずかなブレまたはピント甘め';
+        primaryReason = '瞳・顔領域のピントがやや甘め';
       }
       break;
     }
@@ -523,24 +490,27 @@ export function calculateSceneScore(scene: SceneType, m: RawImageMetrics): Score
       total = sharpness * 0.45 + subjectQuality * 0.3 + exposure * 0.15 + composition * 0.1;
 
       if (sharpness >= 80) {
-        primaryReason = '文字の輪郭がくっきりしており判読性が最も高い';
+        primaryReason = '文字の輪郭がくっきりして読みやすい';
       } else {
-        primaryReason = '文字領域のコントラスト・ピント基準で選出';
+        primaryReason = '文字のコントラスト・ピント基準で選出';
       }
       break;
     }
 
     case 'food': {
       sharpness = Math.round(m.centerSharpness * 0.75 + m.globalSharpness * 0.25);
-      const appetizingColor = Math.min(100, Math.round(50 + m.warmColorRatio * 85 + m.saturationMean * 0.5));
+      const appetizingColor = Math.min(
+        100,
+        Math.round(50 + m.warmColorRatio * 85 + m.saturationMean * 0.5)
+      );
       subjectQuality = appetizingColor;
       composition = Math.round(m.contrastScore * 0.5 + exposure * 0.5);
       total = sharpness * 0.45 + subjectQuality * 0.25 + exposure * 0.2 + composition * 0.1;
 
       if (sharpness >= 80 && subjectQuality >= 78) {
-        primaryReason = '中央の被写体にピントが合い、色ツヤ・明るさが良好';
+        primaryReason = '中央の被写体にピントが合い、色合い・明るさが良好';
       } else {
-        primaryReason = '中央ピントと彩度・露出バランスが優位';
+        primaryReason = '中央のピントと明るさのバランスで選出';
       }
       break;
     }
@@ -549,13 +519,15 @@ export function calculateSceneScore(scene: SceneType, m: RawImageMetrics): Score
     default: {
       sharpness = Math.round(m.globalSharpness * 0.75 + m.centerSharpness * 0.25);
       subjectQuality = m.horizonStraightness;
-      composition = Math.round(m.contrastScore * 0.55 + Math.min(100, m.saturationMean * 1.5) * 0.45);
+      composition = Math.round(
+        m.contrastScore * 0.55 + Math.min(100, m.saturationMean * 1.5) * 0.45
+      );
       total = sharpness * 0.45 + exposure * 0.25 + subjectQuality * 0.15 + composition * 0.15;
 
       if (sharpness >= 82 && exposure >= 82) {
-        primaryReason = '画面全体がシャープで白飛び・黒つぶれが少ない';
+        primaryReason = '全体がシャープで白飛び・黒つぶれが少ない';
       } else {
-        primaryReason = '全体の解像感と階調バランスで選出';
+        primaryReason = '全体の解像感と露出バランスで選出';
       }
       break;
     }

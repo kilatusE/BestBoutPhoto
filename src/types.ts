@@ -21,10 +21,13 @@ export interface RawImageMetrics {
   globalSharpness: number;      // 0-100
   centerSharpness: number;      // 0-100
   faceRegionSharpness: number;  // 0-100
+  eyeRegionSharpness: number;   // 0-100 (1024pxでの瞳・まつ毛ピント)
   faceCount: number;
   faceAreaRatio: number;        // 0-1
   eyeOpenScore: number;         // 0-100
+  isBlinking: boolean;          // 目つぶり検出フラグ
   smileOrFrontalScore: number;  // 0-100
+  faceExposureScore: number;    // 0-100 (顔領域の露出スコア)
   skinToneRatio: number;        // 0-1
   whiteBgRatio: number;         // 0-1
   textEdgeDensity: number;      // 0-100

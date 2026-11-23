@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { AppSettings, PhotoGroup, PhotoItem, SceneType } from './types';
 import { analyzePhotoEntry, pairImportedFiles } from './utils/imageAnalyzer';
+import { getVisionEngines } from './utils/faceDetector';
 import { groupPhotosBySimilarity, SCENE_META } from './utils/groupingEngine';
 import { judgeGroupWithGemini } from './utils/geminiClient';
 import { getSelectedPhotos } from './utils/exportEngine';
@@ -75,6 +76,11 @@ export const App: React.FC = () => {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+
+  // MediaPipe 顔・瞳検出エンジンをバックグラウンドでウォームアップ
+  useEffect(() => {
+    getVisionEngines();
+  }, []);
 
   useEffect(() => {
     try {
